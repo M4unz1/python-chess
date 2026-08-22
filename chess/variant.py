@@ -1,26 +1,13 @@
-# This file is part of the python-chess library.
-# Copyright (C) 2016-2021 Niklas Fiekas <niklas.fiekas@backscattering.de>
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <http://www.gnu.org/licenses/>.
-
 from __future__ import annotations
 
 import chess
-import copy
 import itertools
+import typing
 
 from typing import Dict, Generic, Hashable, Iterable, Iterator, List, Optional, Type, TypeVar, Union
+
+if typing.TYPE_CHECKING:
+    from typing_extensions import Self
 
 
 class SuicideBoard(chess.Board):
@@ -85,16 +72,25 @@ class SuicideBoard(chess.Board):
             return self.is_stalemate() and self._material_balance() == 0
 
     def has_insufficient_material(self, color: chess.Color) -> bool:
-        if self.occupied != self.bishops:
+        if not self.occupied_co[color]:
             return False
-
-        # In a position with only bishops, check if all our bishops can be
-        # captured.
-        we_some_on_light = bool(self.occupied_co[color] & chess.BB_LIGHT_SQUARES)
-        we_some_on_dark = bool(self.occupied_co[color] & chess.BB_DARK_SQUARES)
-        they_all_on_dark = not (self.occupied_co[not color] & chess.BB_LIGHT_SQUARES)
-        they_all_on_light = not (self.occupied_co[not color] & chess.BB_DARK_SQUARES)
-        return (we_some_on_light and they_all_on_dark) or (we_some_on_dark and they_all_on_light)
+        elif not self.occupied_co[not color]:
+            return True
+        elif self.occupied == self.bishops:
+            # In a position with only bishops, check if all our bishops can be
+            # captured.
+            we_some_on_light = bool(self.occupied_co[color] & chess.BB_LIGHT_SQUARES)
+            we_some_on_dark = bool(self.occupied_co[color] & chess.BB_DARK_SQUARES)
+            they_all_on_dark = not (self.occupied_co[not color] & chess.BB_LIGHT_SQUARES)
+            they_all_on_light = not (self.occupied_co[not color] & chess.BB_DARK_SQUARES)
+            return (we_some_on_light and they_all_on_dark) or (we_some_on_dark and they_all_on_light)
+        elif self.occupied == self.knights and chess.popcount(self.knights) == 2:
+            return (
+                self.turn == color ^
+                bool(self.occupied_co[chess.WHITE] & chess.BB_LIGHT_SQUARES) ^
+                bool(self.occupied_co[chess.BLACK] & chess.BB_DARK_SQUARES))
+        else:
+            return False
 
     def generate_pseudo_legal_moves(self, from_mask: chess.Bitboard = chess.BB_ALL, to_mask: chess.Bitboard = chess.BB_ALL) -> Iterator[chess.Move]:
         for move in super().generate_pseudo_legal_moves(from_mask, to_mask):
@@ -131,16 +127,8 @@ class SuicideBoard(chess.Board):
         else:
             return not any(self.generate_pseudo_legal_captures())
 
-    def _transposition_key(self) -> Hashable:
-        if self.has_chess960_castling_rights():
-            return (super()._transposition_key(), self.kings & self.promoted)
-        else:
-            return super()._transposition_key()
-
-    def board_fen(self, promoted: Optional[bool] = None) -> str:
-        if promoted is None:
-            promoted = self.has_chess960_castling_rights()
-        return super().board_fen(promoted=promoted)
+    def _effective_promoted(self) -> chess.Bitboard:
+        return self.kings & self.promoted if self.castling_rights else chess.BB_EMPTY
 
     def status(self) -> chess.Status:
         status = super().status()
@@ -201,7 +189,6 @@ class AtomicBoard(chess.Board):
     tbw_magic = b"\x55\x8d\xa4\x49"
     tbz_magic = b"\x91\xa9\x5e\xeb"
     connected_kings = True
-    one_king = True
 
     def is_variant_end(self) -> bool:
         return not all(self.kings & side for side in self.occupied_co)
@@ -266,9 +253,9 @@ class AtomicBoard(chess.Board):
 
         # Destroy castling rights.
         self.castling_rights &= ~explosion_radius
-        if explosion_radius & self.kings & self.occupied_co[chess.WHITE] & ~self.promoted:
+        if explosion_radius & self.kings & self.occupied_co[chess.WHITE] & ~self._effective_promoted():
             self.castling_rights &= ~chess.BB_RANK_1
-        if explosion_radius & self.kings & self.occupied_co[chess.BLACK] & ~self.promoted:
+        if explosion_radius & self.kings & self.occupied_co[chess.BLACK] & ~self._effective_promoted():
             self.castling_rights &= ~chess.BB_RANK_8
 
         # Explode the capturing piece.
@@ -320,7 +307,8 @@ class AtomicBoard(chess.Board):
             status &= ~chess.STATUS_NO_BLACK_KING
         if chess.popcount(self.checkers_mask()) <= 14:
             status &= ~chess.STATUS_TOO_MANY_CHECKERS
-        status &= ~chess.STATUS_IMPOSSIBLE_CHECK
+        if self._valid_ep_square() is None:
+            status &= ~chess.STATUS_IMPOSSIBLE_CHECK
         return status
 
 
@@ -409,7 +397,7 @@ class RacingKingsBoard(chess.Board):
     def status(self) -> chess.Status:
         status = super().status()
         if self.is_check():
-            status |= chess.STATUS_RACE_CHECK | chess.STATUS_TOO_MANY_CHECKERS
+            status |= chess.STATUS_RACE_CHECK | chess.STATUS_TOO_MANY_CHECKERS | chess.STATUS_IMPOSSIBLE_CHECK
         if self.turn == chess.BLACK and all(self.occupied_co[co] & self.kings & chess.BB_RANK_8 for co in chess.COLORS):
             status |= chess.STATUS_RACE_OVER
         if self.pawns:
@@ -681,14 +669,12 @@ class HordeBoard(chess.Board):
 
 ThreeCheckBoardT = TypeVar("ThreeCheckBoardT", bound="ThreeCheckBoard")
 
-class _ThreeCheckBoardState(Generic[ThreeCheckBoardT], chess._BoardState[ThreeCheckBoardT]):
-    def __init__(self, board: ThreeCheckBoardT) -> None:
-        super().__init__(board)
+class _ThreeCheckBoardState:
+    def __init__(self, board: ThreeCheckBoard) -> None:
         self.remaining_checks_w = board.remaining_checks[chess.WHITE]
         self.remaining_checks_b = board.remaining_checks[chess.BLACK]
 
-    def restore(self, board: ThreeCheckBoardT) -> None:
-        super().restore(board)
+    def restore(self, board: ThreeCheckBoard) -> None:
         board.remaining_checks[chess.WHITE] = self.remaining_checks_w
         board.remaining_checks[chess.BLACK] = self.remaining_checks_b
 
@@ -706,7 +692,12 @@ class ThreeCheckBoard(chess.Board):
 
     def __init__(self, fen: Optional[str] = starting_fen, chess960: bool = False) -> None:
         self.remaining_checks = [3, 3]
+        self._three_check_stack: List[_ThreeCheckBoardState] = []
         super().__init__(fen, chess960=chess960)
+
+    def clear_stack(self) -> None:
+        super().clear_stack()
+        self._three_check_stack.clear()
 
     def reset_board(self) -> None:
         super().reset_board()
@@ -718,13 +709,16 @@ class ThreeCheckBoard(chess.Board):
         self.remaining_checks[chess.WHITE] = 3
         self.remaining_checks[chess.BLACK] = 3
 
-    def _board_state(self: ThreeCheckBoardT) -> _ThreeCheckBoardState[ThreeCheckBoardT]:
-        return _ThreeCheckBoardState(self)
-
     def push(self, move: chess.Move) -> None:
+        self._three_check_stack.append(_ThreeCheckBoardState(self))
         super().push(move)
         if self.is_check():
             self.remaining_checks[not self.turn] -= 1
+
+    def pop(self) -> chess.Move:
+        move = super().pop()
+        self._three_check_stack.pop().restore(self)
+        return move
 
     def has_insufficient_material(self, color: chess.Color) -> bool:
         # Any remaining piece can give check.
@@ -770,7 +764,7 @@ class ThreeCheckBoard(chess.Board):
         self.remaining_checks[chess.WHITE] = wc
         self.remaining_checks[chess.BLACK] = bc
 
-    def epd(self, shredder: bool = False, en_passant: chess._EnPassantSpec = "legal", promoted: Optional[bool] = None, **operations: Union[None, str, int, float, chess.Move, Iterable[chess.Move]]) -> str:
+    def epd(self, shredder: bool = False, en_passant: chess.EnPassantSpec = "legal", promoted: Optional[bool] = None, **operations: Union[None, str, int, float, chess.Move, Iterable[chess.Move]]) -> str:
         epd = [super().epd(shredder=shredder, en_passant=en_passant, promoted=promoted),
                "{:d}+{:d}".format(max(self.remaining_checks[chess.WHITE], 0),
                                   max(self.remaining_checks[chess.BLACK], 0))]
@@ -797,12 +791,23 @@ class ThreeCheckBoard(chess.Board):
         return (super()._transposition_key(),
                 self.remaining_checks[chess.WHITE], self.remaining_checks[chess.BLACK])
 
-    def copy(self: ThreeCheckBoardT, stack: Union[bool, int] = True) -> ThreeCheckBoardT:
+    def copy(self, *, stack: Union[bool, int] = True) -> Self:
         board = super().copy(stack=stack)
         board.remaining_checks = self.remaining_checks.copy()
+        if stack:
+            stack = len(self.move_stack) if stack is True else stack
+            board._three_check_stack = self._three_check_stack[-stack:]
         return board
 
-    def mirror(self: ThreeCheckBoardT) -> ThreeCheckBoardT:
+    def root(self) -> Self:
+        if self._three_check_stack:
+            board = super().root()
+            self._three_check_stack[0].restore(board)
+            return board
+        else:
+            return self.copy(stack=False)
+
+    def mirror(self) -> Self:
         board = super().mirror()
         board.remaining_checks[chess.WHITE] = self.remaining_checks[chess.BLACK]
         board.remaining_checks[chess.BLACK] = self.remaining_checks[chess.WHITE]
@@ -811,14 +816,12 @@ class ThreeCheckBoard(chess.Board):
 
 CrazyhouseBoardT = TypeVar("CrazyhouseBoardT", bound="CrazyhouseBoard")
 
-class _CrazyhouseBoardState(Generic[CrazyhouseBoardT], chess._BoardState[CrazyhouseBoardT]):
-    def __init__(self, board: CrazyhouseBoardT) -> None:
-        super().__init__(board)
+class _CrazyhouseBoardState:
+    def __init__(self, board: CrazyhouseBoard) -> None:
         self.pockets_w = board.pockets[chess.WHITE].copy()
         self.pockets_b = board.pockets[chess.BLACK].copy()
 
-    def restore(self, board: CrazyhouseBoardT) -> None:
-        super().restore(board)
+    def restore(self, board: CrazyhouseBoard) -> None:
         board.pockets[chess.WHITE] = self.pockets_w
         board.pockets[chess.BLACK] = self.pockets_b
 
@@ -828,39 +831,40 @@ class CrazyhousePocket:
     """A Crazyhouse pocket with a counter for each piece type."""
 
     def __init__(self, symbols: Iterable[str] = "") -> None:
-        self.pieces: Dict[chess.PieceType, int] = {}
+        self.reset()
         for symbol in symbols:
             self.add(chess.PIECE_SYMBOLS.index(symbol))
 
+    def reset(self) -> None:
+        """Clears the pocket."""
+        self._pieces = [-1, 0, 0, 0, 0, 0, 0]
+
     def add(self, piece_type: chess.PieceType) -> None:
         """Adds a piece of the given type to this pocket."""
-        self.pieces[piece_type] = self.pieces.get(piece_type, 0) + 1
+        self._pieces[piece_type] += 1
 
     def remove(self, piece_type: chess.PieceType) -> None:
         """Removes a piece of the given type from this pocket."""
-        self.pieces[piece_type] -= 1
+        assert self._pieces[piece_type], f"cannot remove {chess.piece_symbol(piece_type)} from {self!r}"
+        self._pieces[piece_type] -= 1
 
     def count(self, piece_type: chess.PieceType) -> int:
         """Returns the number of pieces of the given type in the pocket."""
-        return self.pieces.get(piece_type, 0)
-
-    def reset(self) -> None:
-        """Clears the pocket."""
-        self.pieces.clear()
+        return self._pieces[piece_type]
 
     def __str__(self) -> str:
         return "".join(chess.piece_symbol(pt) * self.count(pt) for pt in reversed(chess.PIECE_TYPES))
 
     def __len__(self) -> int:
-        return sum(self.pieces.values())
+        return sum(self._pieces[1:])
 
     def __repr__(self) -> str:
         return f"CrazyhousePocket('{self}')"
 
-    def copy(self: CrazyhousePocketT) -> CrazyhousePocketT:
+    def copy(self) -> Self:
         """Returns a copy of this pocket."""
         pocket = type(self)()
-        pocket.pieces = copy.copy(self.pieces)
+        pocket._pieces = self._pieces[:]
         return pocket
 
 class CrazyhouseBoard(chess.Board):
@@ -877,7 +881,12 @@ class CrazyhouseBoard(chess.Board):
 
     def __init__(self, fen: Optional[str] = starting_fen, chess960: bool = False) -> None:
         self.pockets = [CrazyhousePocket(), CrazyhousePocket()]
+        self._crazyhouse_stack: List[_CrazyhouseBoardState] = []
         super().__init__(fen, chess960=chess960)
+
+    def clear_stack(self) -> None:
+        super().clear_stack()
+        self._crazyhouse_stack.clear()
 
     def reset_board(self) -> None:
         super().reset_board()
@@ -889,10 +898,8 @@ class CrazyhouseBoard(chess.Board):
         self.pockets[chess.WHITE].reset()
         self.pockets[chess.BLACK].reset()
 
-    def _board_state(self: CrazyhouseBoardT) -> _CrazyhouseBoardState[CrazyhouseBoardT]:
-        return _CrazyhouseBoardState(self)
-
     def push(self, move: chess.Move) -> None:
+        self._crazyhouse_stack.append(_CrazyhouseBoardState(self))
         super().push(move)
         if move.drop:
             self.pockets[not self.turn].remove(move.drop)
@@ -903,6 +910,11 @@ class CrazyhouseBoard(chess.Board):
         else:
             self.pockets[self.turn].add(piece_type)
 
+    def pop(self) -> chess.Move:
+        move = super().pop()
+        self._crazyhouse_stack.pop().restore(self)
+        return move
+
     def _is_halfmoves(self, n: int) -> bool:
         # No draw by 50-move rule or 75-move rule.
         return False
@@ -910,9 +922,11 @@ class CrazyhouseBoard(chess.Board):
     def is_irreversible(self, move: chess.Move) -> bool:
         return self._reduces_castling_rights(move)
 
+    def _effective_promoted(self) -> chess.Bitboard:
+        return self.promoted & ~self.kings & ~self.pawns
+
     def _transposition_key(self) -> Hashable:
         return (super()._transposition_key(),
-                self.promoted,
                 str(self.pockets[chess.WHITE]), str(self.pockets[chess.BLACK]))
 
     def legal_drop_squares_mask(self) -> chess.Bitboard:
@@ -958,9 +972,9 @@ class CrazyhouseBoard(chess.Board):
             return super().is_legal(move)
 
     def generate_pseudo_legal_drops(self, to_mask: chess.Bitboard = chess.BB_ALL) -> Iterator[chess.Move]:
-        for to_square in chess.scan_forward(to_mask & ~self.occupied):
-            for pt, count in self.pockets[self.turn].pieces.items():
-                if count and (pt != chess.PAWN or not chess.BB_BACKRANKS & chess.BB_SQUARES[to_square]):
+        for pt in chess.PIECE_TYPES:
+            if self.pockets[self.turn].count(pt):
+                for to_square in chess.scan_forward(to_mask & ~self.occupied & (~chess.BB_BACKRANKS if pt == chess.PAWN else chess.BB_ALL)):
                     yield chess.Move(to_square, to_square, drop=pt)
 
     def generate_legal_drops(self, to_mask: chess.Bitboard = chess.BB_ALL) -> Iterator[chess.Move]:
@@ -978,7 +992,7 @@ class CrazyhouseBoard(chess.Board):
                 uci = "P" + uci
             move = chess.Move.from_uci(uci)
             if not self.is_legal(move):
-                raise ValueError(f"illegal drop san: {san!r} in {self.fen()}")
+                raise chess.IllegalMoveError(f"illegal drop san: {san!r} in {self.fen()}")
             return move
         else:
             return super().parse_san(san)
@@ -989,7 +1003,7 @@ class CrazyhouseBoard(chess.Board):
         # a different color complex.
         return (
             chess.popcount(self.occupied) + sum(len(pocket) for pocket in self.pockets) <= 3 and
-            not self.promoted and
+            not self._effective_promoted() and
             not self.pawns and
             not self.rooks and
             not self.queens and
@@ -1021,23 +1035,29 @@ class CrazyhouseBoard(chess.Board):
         self.pockets[chess.WHITE] = white_pocket
         self.pockets[chess.BLACK] = black_pocket
 
-    def board_fen(self, promoted: Optional[bool] = None) -> str:
-        if promoted is None:
-            promoted = True
-        return super().board_fen(promoted=promoted)
-
-    def epd(self, shredder: bool = False, en_passant: chess._EnPassantSpec = "legal", promoted: Optional[bool] = None, **operations: Union[None, str, int, float, chess.Move, Iterable[chess.Move]]) -> str:
+    def epd(self, shredder: bool = False, en_passant: chess.EnPassantSpec = "legal", promoted: Optional[bool] = None, **operations: Union[None, str, int, float, chess.Move, Iterable[chess.Move]]) -> str:
         epd = super().epd(shredder=shredder, en_passant=en_passant, promoted=promoted)
         board_part, info_part = epd.split(" ", 1)
         return f"{board_part}[{str(self.pockets[chess.WHITE]).upper()}{self.pockets[chess.BLACK]}] {info_part}"
 
-    def copy(self: CrazyhouseBoardT, stack: Union[bool, int] = True) -> CrazyhouseBoardT:
+    def copy(self, *, stack: Union[bool, int] = True) -> Self:
         board = super().copy(stack=stack)
         board.pockets[chess.WHITE] = self.pockets[chess.WHITE].copy()
         board.pockets[chess.BLACK] = self.pockets[chess.BLACK].copy()
+        if stack:
+            stack = len(self.move_stack) if stack is True else stack
+            board._crazyhouse_stack = self._crazyhouse_stack[-stack:]
         return board
 
-    def mirror(self: CrazyhouseBoardT) -> CrazyhouseBoardT:
+    def root(self) -> Self:
+        if self._crazyhouse_stack:
+            board = super().root()
+            self._crazyhouse_stack[0].restore(board)
+            return board
+        else:
+            return self.copy(stack=False)
+
+    def mirror(self) -> Self:
         board = super().mirror()
         board.pockets[chess.WHITE] = self.pockets[chess.BLACK].copy()
         board.pockets[chess.BLACK] = self.pockets[chess.WHITE].copy()
